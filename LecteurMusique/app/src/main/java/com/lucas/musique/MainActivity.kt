@@ -95,7 +95,8 @@ class MainActivity : ComponentActivity() {
             )
             contentResolver.query(
                 MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj,
-                "${MediaStore.Audio.Media.IS_MUSIC} != 0", null,
+                "${MediaStore.Audio.Media.DATA} LIKE ? OR ${MediaStore.Audio.Media.DATA} LIKE ?",
+                arrayOf("/storage/emulated/0/Music/%", "/storage/%-%/Music/%"),
                 "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
             )?.use { c ->
                 val iId = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
