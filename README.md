@@ -26,24 +26,16 @@ Le projet est volontairement modeste et sert aussi de terrain d'expérimentation
 - Un appareil ou un émulateur Android **8.0 (API 26) ou ultérieur**.
 - Des fichiers audio locaux dans le dossier `Music` de l'appareil.
 
-## Ouvrir et lancer l'application
+## Compiler et obtenir l'APK
 
-Le projet Gradle Android se trouve dans le dossier `LecteurMusique` :
+La compilation se fait avec Android Studio :
 
-1. Ouvrir ce dossier dans Android Studio.
+1. Ouvrir le dossier `LecteurMusique` dans Android Studio.
 2. Laisser Android Studio synchroniser le projet et installer les composants du SDK manquants si nécessaire.
-3. Connecter un appareil Android ou démarrer un émulateur.
-4. Lancer la configuration `app`.
-5. À la première ouverture, autoriser l'accès aux fichiers audio pour afficher les morceaux.
+3. Dans le menu, choisir **Build > Build Bundle(s) / APK(s) > Build APK(s)**.
+4. Attendre la fin de la compilation, puis cliquer sur **locate** dans la notification de succès pour ouvrir le dossier de sortie.
 
-Pour compiler un APK de débogage depuis PowerShell, avec Gradle installé et disponible dans le `PATH` :
-
-```powershell
-cd .\LecteurMusique
-gradle :app:assembleDebug
-```
-
-L'APK est généré dans `LecteurMusique\app\build\outputs\apk\debug\app-debug.apk`.
+L'APK de débogage généré se trouve dans `LecteurMusique\app\build\outputs\apk\debug\app-debug.apk`. Il peut être copié sur un appareil Android pour installer l'application.
 
 ## Utilisation
 
