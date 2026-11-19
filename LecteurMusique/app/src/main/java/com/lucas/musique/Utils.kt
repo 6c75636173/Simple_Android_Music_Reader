@@ -1,0 +1,148 @@
+@file:OptIn(UnstableApi::class)
+
+package com.lucas.musique
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.os.Build
+import android.util.Size
+import androidx.media3.common.MediaItem
+import androidx.media3.common.util.BitmapLoader
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.MetadataRetriever
+import androidx.media3.extractor.metadata.id3.BinaryFrame
+import androidx.media3.extractor.metadata.id3.CommentFrame
+import androidx.media3.extractor.metadata.vorbis.VorbisComment
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.MoreExecutors
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.FileNotFoundException
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+
+/** Nom de la commande personnalisée (égaliseur / normalisation) envoyée au service. */
+const val CMD_AUDIO = "com.lucas.musique.AUDIO"
+
+/** Pochette : miniature Android (API 29+), sinon image intégrée au fichier. */
+fun loadCoverBlocking(ctx: Context, uri: Uri, px: Int = 600): Bitmap? {
+    if (Build.VERSION.SDK_INT >= 29) {
+        try {
+            return ctx.contentResolver.loadThumbnail(uri, Size(px, px), null)
+        } catch (_: Exception) {
+        }
+    }
+    return try {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(ctx, uri)
+            r.embeddedPicture?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+        } finally {
+            r.release()
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/** Permet à la notification et à l'écran verrouillé d'afficher la pochette du fichier audio. */
+class CoverBitmapLoader(private val ctx: Context) : BitmapLoader {
+    private val exec = MoreExecutors.listeningDecorator(Executors.newSingleThreadExecutor())
+
+    override fun supportsMimeType(mimeType: String): Boolean = true
+
+    override fun decodeBitmap(data: ByteArray): ListenableFuture<Bitmap> =
+        exec.submit(Callable<Bitmap> {
+            BitmapFactory.decodeByteArray(data, 0, data.size)
+                ?: throw IllegalStateException("Image illisible")
+        })
+
+    override fun loadBitmap(uri: Uri): ListenableFuture<Bitmap> =
+        exec.submit(Callable<Bitmap> {
+            loadCoverBlocking(ctx, uri) ?: throw FileNotFoundException("Pas de pochette")
+        })
+}
+
+/** Paroles intégrées au fichier (ID3 USLT pour le MP3, tag LYRICS pour FLAC/OGG). */
+suspend fun loadLyrics(ctx: Context, uri: Uri): String? = withContext(Dispatchers.IO) {
+    try {
+        val groups = MetadataRetriever.retrieveMetadata(ctx, MediaItem.fromUri(uri)).get()
+        for (i in 0 until groups.length) {
+            val g = groups.get(i)
+            for (j in 0 until g.length) {
+                val md = g.getFormat(j).metadata ?: continue
+                for (k in 0 until md.length()) {
+                    when (val e = md.get(k)) {
+                        is BinaryFrame ->
+                            if (e.id == "USLT" || e.id == "ULT")
+                                parseUslt(e.data)?.let { return@withContext it }
+                        is CommentFrame ->
+                            if (e.id == "USLT" || e.id == "ULT")
+                                e.text.trim().takeIf { it.isNotEmpty() }?.let { return@withContext it }
+                        is VorbisComment ->
+                            if (e.key.equals("LYRICS", true) || e.key.equals("UNSYNCEDLYRICS", true))
+                                e.value.trim().takeIf { it.isNotEmpty() }?.let { return@withContext it }
+                        else -> {}
+                    }
+                }
+            }
+        }
+        null
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun parseUslt(d: ByteArray): String? {
+    if (d.size < 5) return null
+    val enc = d[0].toInt()
+    val cs = when (enc) {
+        0 -> Charsets.ISO_8859_1
+        1 -> Charsets.UTF_16
+        2 -> Charsets.UTF_16BE
+        else -> Charsets.UTF_8
+    }
+    var i = 4 // 1 octet d'encodage + 3 octets de langue
+    if (enc == 1 || enc == 2) {
+        while (i + 1 < d.size && !(d[i].toInt() == 0 && d[i + 1].toInt() == 0)) i += 2
+        i += 2
+    } else {
+        while (i < d.size && d[i].toInt() != 0) i++
+        i++
+    }
+    if (i >= d.size) return null
+    return String(d, i, d.size - i, cs).trim().ifEmpty { null }
+}
+
+/** Sauvegarde des playlists (nom -> liste d'identifiants de titres). */
+class PlaylistStore(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("playlists", Context.MODE_PRIVATE)
+
+    fun load(): Map<String, List<Long>> {
+        val out = LinkedHashMap<String, List<Long>>()
+        try {
+            val o = JSONObject(sp.getString("data", "{}") ?: "{}")
+            for (k in o.keys()) {
+                val a = o.getJSONArray(k)
+                out[k] = List(a.length()) { a.getLong(it) }
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    fun save(m: Map<String, List<Long>>) {
+        val o = JSONObject()
+        for ((k, v) in m) {
+            val a = JSONArray()
+            v.forEach { a.put(it) }
+            o.put(k, a)
+        }
+        sp.edit().putString("data", o.toString()).apply()
+    }
+}
