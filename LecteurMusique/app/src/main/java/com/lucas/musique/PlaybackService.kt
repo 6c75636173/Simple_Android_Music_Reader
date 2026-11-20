@@ -1,5 +1,3 @@
-@file:OptIn(UnstableApi::class)
-
 package com.lucas.musique
 
 import android.content.Intent
@@ -8,12 +6,14 @@ import android.media.audiofx.DynamicsProcessing
 import android.media.audiofx.Equalizer
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import androidx.annotation.RequiresApi
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
@@ -21,22 +21,51 @@ import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import kotlin.math.cos
+import kotlin.math.sin
 
-/** Service de lecture : musique en arrière-plan, notification, égaliseur, normalisation. */
+/**
+ * Service de lecture : arrière-plan, notification, égaliseur, normalisation,
+ * fondu enchaîné (2 lecteurs), minuteur d'arrêt et widget.
+ */
 class PlaybackService : MediaSessionService() {
 
     private var session: MediaSession? = null
+    private lateinit var player: ExoPlayer
+    private var fader: ExoPlayer? = null // joue la fin du titre sortant pendant le fondu
     private var eq: Equalizer? = null
     private var dp: DynamicsProcessing? = null
     private lateinit var audioPrefs: SharedPreferences
+    private val handler = Handler(Looper.getMainLooper())
+
+    // --- état du fondu enchaîné ---
+    private var xfadeMs = 0L
+    private var fadeStart = 0L // 0 = pas de fondu en cours
+    private var fadePrepared = false
+    private var preparedId: String? = null
+
+    private val tick = object : Runnable {
+        override fun run() {
+            try {
+                onTick()
+            } catch (_: Exception) {
+            }
+            if (player.isPlaying || fadeStart != 0L) handler.postDelayed(this, 50)
+        }
+    }
+
+    private val sleepStop = Runnable {
+        player.pause()
+        audioPrefs.edit().putLong("sleepEnd", 0L).apply()
+    }
 
     override fun onCreate() {
         super.onCreate()
         audioPrefs = getSharedPreferences("audio", MODE_PRIVATE)
+        xfadeMs = audioPrefs.getInt("xfade", 0) * 1000L
+        audioPrefs.edit().putLong("sleepEnd", 0L).apply()
 
-        // La lecture sans blanc (gapless) est gérée automatiquement par ExoPlayer
-        // quand les fichiers contiennent les infos nécessaires (MP3 LAME, AAC/M4A, FLAC...).
-        val player = ExoPlayer.Builder(this)
+        player = ExoPlayer.Builder(this)
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -50,11 +79,28 @@ class PlaybackService : MediaSessionService() {
 
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                if (!isPlaying) saveResume(player)
+                if (isPlaying) {
+                    handler.removeCallbacks(tick)
+                    handler.post(tick)
+                } else {
+                    saveResume(player)
+                }
+                updateWidget()
+            }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (!playWhenReady) abortFade() // pause : on coupe le fondu
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 saveResume(player)
+                if (fadeStart != 0L) {
+                    // la transition déclenchée par le fondu lui-même arrive dans les 800 ms
+                    if (SystemClock.uptimeMillis() - fadeStart > 800) abortFade()
+                } else {
+                    fadePrepared = false
+                }
+                updateWidget()
             }
 
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
@@ -73,6 +119,7 @@ class PlaybackService : MediaSessionService() {
                 ): MediaSession.ConnectionResult {
                     val cmds = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
                         .add(SessionCommand(CMD_AUDIO, Bundle.EMPTY))
+                        .add(SessionCommand(CMD_SLEEP, Bundle.EMPTY))
                         .build()
                     return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
                         .setAvailableSessionCommands(cmds)
@@ -85,13 +132,31 @@ class PlaybackService : MediaSessionService() {
                     customCommand: SessionCommand,
                     args: Bundle
                 ): ListenableFuture<SessionResult> {
-                    if (customCommand.customAction == CMD_AUDIO) {
-                        audioPrefs.edit()
-                            .putFloat("bass", args.getFloat("bass", 0f))
-                            .putFloat("treble", args.getFloat("treble", 0f))
-                            .putBoolean("norm", args.getBoolean("norm", false))
-                            .apply()
-                        applyEffects()
+                    when (customCommand.customAction) {
+                        CMD_AUDIO -> {
+                            val xf = args.getInt("xfade", 0).coerceIn(0, 12)
+                            audioPrefs.edit()
+                                .putFloat("bass", args.getFloat("bass", 0f))
+                                .putFloat("treble", args.getFloat("treble", 0f))
+                                .putBoolean("norm", args.getBoolean("norm", false))
+                                .putInt("xfade", xf)
+                                .apply()
+                            xfadeMs = xf * 1000L
+                            if (xfadeMs == 0L && fadeStart == 0L) fadePrepared = false
+                            applyEffects()
+                        }
+                        CMD_SLEEP -> {
+                            val min = args.getInt("min", 0)
+                            handler.removeCallbacks(sleepStop)
+                            if (min > 0) {
+                                handler.postDelayed(sleepStop, min * 60_000L)
+                                audioPrefs.edit()
+                                    .putLong("sleepEnd", System.currentTimeMillis() + min * 60_000L)
+                                    .apply()
+                            } else {
+                                audioPrefs.edit().putLong("sleepEnd", 0L).apply()
+                            }
+                        }
                     }
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                 }
@@ -110,6 +175,130 @@ class PlaybackService : MediaSessionService() {
                 }
             })
             .build()
+    }
+
+    // ------------------------------------------------------------------
+    // Fondu enchaîné : un 2e lecteur joue la fin du titre qui sort pendant
+    // que le lecteur principal démarre le titre suivant. Volumes en
+    // puissance constante (sinus / cosinus).
+    // ------------------------------------------------------------------
+
+    private fun onTick() {
+        if (fadeStart != 0L) {
+            stepFade()
+            return
+        }
+        if (xfadeMs <= 0L || !player.isPlaying) return
+        if (player.repeatMode == Player.REPEAT_MODE_ONE || !player.hasNextMediaItem()) {
+            fadePrepared = false
+            return
+        }
+        val dur = player.duration
+        if (dur == C.TIME_UNSET || dur < xfadeMs * 2 + 2000) return // titre trop court
+        val remaining = dur - player.currentPosition
+        if (remaining <= xfadeMs + 2500 && !fadePrepared) prepareFader()
+        if (remaining <= xfadeMs && fadePrepared) startFade()
+    }
+
+    private fun buildFader(): ExoPlayer {
+        val f = ExoPlayer.Builder(this)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                false // le focus audio reste géré par le lecteur principal
+            )
+            .build()
+        f.audioSessionId = player.audioSessionId // mêmes effets (égaliseur, normalisation)
+        return f
+    }
+
+    private fun prepareFader() {
+        val item = player.currentMediaItem ?: return
+        val f = fader ?: buildFader().also { fader = it }
+        f.setMediaItem(item)
+        f.volume = 0f
+        f.playWhenReady = false
+        f.prepare()
+        preparedId = item.mediaId
+        fadePrepared = true
+    }
+
+    private fun startFade() {
+        val f = fader ?: return
+        if (preparedId != player.currentMediaItem?.mediaId) {
+            fadePrepared = false
+            return
+        }
+        fadePrepared = false
+        f.playbackParameters = player.playbackParameters
+        f.seekTo(player.currentPosition + 120)
+        f.volume = 1f
+        f.play()
+        fadeStart = SystemClock.uptimeMillis()
+        player.volume = 0f
+        player.seekToNextMediaItem()
+    }
+
+    private fun stepFade() {
+        if (xfadeMs <= 0L) {
+            endFade()
+            return
+        }
+        val t = ((SystemClock.uptimeMillis() - fadeStart).toFloat() / xfadeMs).coerceIn(0f, 1f)
+        val a = t * Math.PI / 2
+        player.volume = sin(a).toFloat()
+        fader?.volume = cos(a).toFloat()
+        if (t >= 1f) endFade()
+    }
+
+    private fun endFade() {
+        fadeStart = 0L
+        fadePrepared = false
+        player.volume = 1f
+        fader?.let {
+            try {
+                it.stop()
+                it.clearMediaItems()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun abortFade() {
+        val active = fadeStart != 0L || fadePrepared
+        fadeStart = 0L
+        fadePrepared = false
+        if (!active) return
+        player.volume = 1f
+        fader?.let {
+            try {
+                it.stop()
+                it.clearMediaItems()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+
+    private fun updateWidget() {
+        if (!MusicWidget.hasWidgets(applicationContext)) return
+        val md = player.mediaMetadata
+        val title = md.title?.toString() ?: "Lecteur"
+        val artist = md.artist?.toString() ?: ""
+        val playing = player.isPlaying
+        val uri = player.currentMediaItem?.localConfiguration?.uri
+        getSharedPreferences("widget", MODE_PRIVATE).edit()
+            .putString("title", title)
+            .putString("artist", artist)
+            .putBoolean("playing", playing)
+            .apply()
+        Thread {
+            val bmp = uri?.let { loadCoverBlocking(applicationContext, it, 200) }
+            handler.post { MusicWidget.update(applicationContext, title, artist, playing, bmp) }
+        }.start()
     }
 
     private fun saveResume(p: Player) {
@@ -185,9 +374,12 @@ class PlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         session?.player?.let { saveResume(it) }
         try { eq?.release() } catch (_: Exception) {}
         try { dp?.release() } catch (_: Exception) {}
+        try { fader?.release() } catch (_: Exception) {}
+        fader = null
         session?.run {
             player.release()
             release()

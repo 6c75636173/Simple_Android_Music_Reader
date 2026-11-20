@@ -1,5 +1,3 @@
-@file:OptIn(UnstableApi::class)
-
 package com.lucas.musique
 
 import android.content.Context
@@ -8,10 +6,10 @@ import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
+import android.provider.DocumentsContract
 import android.util.Size
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.BitmapLoader
-import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.MetadataRetriever
 import androidx.media3.extractor.metadata.id3.BinaryFrame
 import androidx.media3.extractor.metadata.id3.CommentFrame
@@ -28,6 +26,29 @@ import java.util.concurrent.Executors
 
 /** Nom de la commande personnalisée (égaliseur / normalisation) envoyée au service. */
 const val CMD_AUDIO = "com.lucas.musique.AUDIO"
+
+/** Commande du minuteur d'arrêt (minutes ; 0 = annuler). */
+const val CMD_SLEEP = "com.lucas.musique.SLEEP"
+
+/** Dossiers scannés par défaut : Music du stockage interne et de la carte SD. */
+val DEFAULT_FOLDERS = listOf("/storage/emulated/0/Music", "/storage/%-%/Music")
+
+fun folderLabel(p: String): String =
+    if (p.contains("%-%")) p.replace("/storage/%-%", "Carte SD") else p
+
+/** Convertit le dossier choisi dans le sélecteur Android en chemin de fichier. */
+fun treeUriToPath(uri: Uri): String? {
+    val id = try {
+        DocumentsContract.getTreeDocumentId(uri)
+    } catch (_: Exception) {
+        return null
+    }
+    val parts = id.split(":", limit = 2)
+    val vol = parts[0]
+    val rel = parts.getOrNull(1) ?: ""
+    val base = if (vol == "primary") "/storage/emulated/0" else "/storage/$vol"
+    return if (rel.isEmpty()) base else "$base/$rel"
+}
 
 /** Pochette : miniature Android (API 29+), sinon image intégrée au fichier. */
 fun loadCoverBlocking(ctx: Context, uri: Uri, px: Int = 600): Bitmap? {
@@ -142,6 +163,45 @@ class PlaylistStore(ctx: Context) {
             val a = JSONArray()
             v.forEach { a.put(it) }
             o.put(k, a)
+        }
+        sp.edit().putString("data", o.toString()).apply()
+    }
+}
+
+/** Favoris (identifiants de titres). */
+class FavStore(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("favs", Context.MODE_PRIVATE)
+
+    fun load(): Set<Long> =
+        (sp.getString("ids", "") ?: "").split(",").mapNotNull { it.toLongOrNull() }.toSet()
+
+    fun save(ids: Set<Long>) {
+        sp.edit().putString("ids", ids.joinToString(",")).apply()
+    }
+}
+
+/** Titres / artistes modifiés dans l'appli (le fichier audio n'est pas touché). */
+class MetaStore(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("meta", Context.MODE_PRIVATE)
+
+    fun load(): Map<Long, Pair<String, String>> {
+        val out = LinkedHashMap<Long, Pair<String, String>>()
+        try {
+            val o = JSONObject(sp.getString("data", "{}") ?: "{}")
+            for (k in o.keys()) {
+                val e = o.getJSONObject(k)
+                val id = k.toLongOrNull() ?: continue
+                out[id] = Pair(e.optString("t"), e.optString("a"))
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    fun save(m: Map<Long, Pair<String, String>>) {
+        val o = JSONObject()
+        for ((id, v) in m) {
+            o.put(id.toString(), JSONObject().put("t", v.first).put("a", v.second))
         }
         sp.edit().putString("data", o.toString()).apply()
     }

@@ -1,5 +1,3 @@
-@file:OptIn(UnstableApi::class)
-
 package com.lucas.musique
 
 import android.Manifest
@@ -14,9 +12,12 @@ import android.os.Bundle
 import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -28,6 +29,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -41,7 +43,6 @@ import androidx.core.view.WindowCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionToken
@@ -49,8 +50,11 @@ import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import java.io.File
 import kotlin.concurrent.thread
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 data class Track(
     val id: Long,
@@ -66,15 +70,20 @@ sealed interface Entry {
     data class Item(val track: Track) : Entry
 }
 
-private const val TAB_PLAYLISTS = 4
-private val TABS = listOf("Titres", "Artistes", "Albums", "Dossiers", "Playlists")
+private const val TAB_FAV = 4
+private const val TAB_PLAYLISTS = 5
+private val TABS = listOf("Titres", "Artistes", "Albums", "Dossiers", "Favoris", "Playlists")
 
 class MainActivity : ComponentActivity() {
 
     private val controller = mutableStateOf<MediaController?>(null)
     private val tracks = mutableStateListOf<Track>()
+    private val folders = mutableStateListOf<String>()
+    private val rev = mutableIntStateOf(0)
     private var future: ListenableFuture<MediaController>? = null
     private val ui by lazy { getSharedPreferences("ui", MODE_PRIVATE) }
+    private val metaStore by lazy { MetaStore(this) }
+    private val meta = LinkedHashMap<Long, Pair<String, String>>()
 
     private val permLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -83,6 +92,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        folders.addAll(readFolders())
+        meta.putAll(metaStore.load())
         setContent {
             var mode by remember { mutableIntStateOf(ui.getInt("theme", 0)) } // 0 auto, 1 clair, 2 sombre
             var dyn by remember { mutableStateOf(ui.getBoolean("dyn", true)) }
@@ -109,10 +120,14 @@ class MainActivity : ComponentActivity() {
                     PlayerScreen(
                         c = controller.value,
                         tracks = tracks,
+                        rev = rev.intValue,
+                        folders = folders,
                         themeMode = mode,
                         dynamic = dyn,
                         onTheme = { mode = it; ui.edit().putInt("theme", it).apply() },
-                        onDynamic = { dyn = it; ui.edit().putBoolean("dyn", it).apply() }
+                        onDynamic = { dyn = it; ui.edit().putBoolean("dyn", it).apply() },
+                        onFolders = { setFolders(it) },
+                        onEdit = { t, title, artist -> editTrack(t, title, artist) }
                     )
                 }
             }
@@ -142,10 +157,39 @@ class MainActivity : ComponentActivity() {
         super.onStop()
     }
 
+    private fun readFolders(): List<String> {
+        val s = ui.getString("folders", null) ?: return DEFAULT_FOLDERS
+        return try {
+            val a = JSONArray(s)
+            List(a.length()) { a.getString(it) }.ifEmpty { DEFAULT_FOLDERS }
+        } catch (_: Exception) {
+            DEFAULT_FOLDERS
+        }
+    }
+
+    private fun setFolders(list: List<String>) {
+        val l = list.ifEmpty { DEFAULT_FOLDERS }
+        folders.clear()
+        folders.addAll(l)
+        ui.edit().putString("folders", JSONArray(l).toString()).apply()
+        loadTracks()
+    }
+
+    private fun editTrack(t: Track, title: String, artist: String) {
+        val nt = title.trim().ifEmpty { t.title }
+        val na = artist.trim()
+        meta[t.id] = Pair(nt, na)
+        metaStore.save(meta)
+        val i = tracks.indexOfFirst { it.id == t.id }
+        if (i >= 0) tracks[i] = t.copy(title = nt, artist = na)
+        rev.intValue = rev.intValue + 1
+    }
+
     private fun loadTracks() {
         val perm = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
         else Manifest.permission.READ_EXTERNAL_STORAGE
         if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) return
+        val paths = folders.toList().ifEmpty { DEFAULT_FOLDERS }
         thread {
             val list = mutableListOf<Track>()
             val proj = arrayOf(
@@ -155,10 +199,10 @@ class MainActivity : ComponentActivity() {
                 MediaStore.Audio.Media.ALBUM,
                 MediaStore.Audio.Media.DATA
             )
+            val selection = paths.joinToString(" OR ") { "${MediaStore.Audio.Media.DATA} LIKE ?" }
+            val args = paths.map { it.trimEnd('/') + "/%" }.toTypedArray()
             contentResolver.query(
-                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj,
-                "${MediaStore.Audio.Media.DATA} LIKE ? OR ${MediaStore.Audio.Media.DATA} LIKE ?",
-                arrayOf("/storage/emulated/0/Music/%", "/storage/%-%/Music/%"),
+                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj, selection, args,
                 "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC"
             )?.use { c ->
                 val iId = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
@@ -168,11 +212,13 @@ class MainActivity : ComponentActivity() {
                 val iData = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
                 while (c.moveToNext()) {
                     val id = c.getLong(iId)
-                    val artist = c.getString(iArtist)?.takeIf { it != "<unknown>" } ?: ""
+                    var title = c.getString(iTitle) ?: "Sans titre"
+                    var artist = c.getString(iArtist)?.takeIf { it != "<unknown>" } ?: ""
+                    meta[id]?.let { title = it.first; artist = it.second }
                     val album = c.getString(iAlbum) ?: ""
                     val folder = c.getString(iData)?.let { File(it).parentFile?.name } ?: ""
                     list += Track(
-                        id, c.getString(iTitle) ?: "Sans titre", artist, album, folder,
+                        id, title, artist, album, folder,
                         ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
                     )
                 }
@@ -246,11 +292,14 @@ private fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
 private fun TrackRow(
     t: Track,
     current: Boolean,
+    fav: Boolean,
     playlists: Map<String, List<Long>>,
     inPlaylist: String?,
     onPlay: () -> Unit,
+    onFav: () -> Unit,
     onAdd: (String) -> Unit,
     onNew: () -> Unit,
+    onEdit: () -> Unit,
     onRemove: () -> Unit
 ) {
     var open by remember { mutableStateOf(false) }
@@ -271,9 +320,14 @@ private fun TrackRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
         }
+        TextButton(onClick = onFav) { Text(if (fav) "❤" else "♡", fontSize = 18.sp) }
         Box {
             TextButton(onClick = { open = true }) { Text("⋮", fontSize = 20.sp) }
             DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                DropdownMenuItem(
+                    text = { Text("Modifier les infos") },
+                    onClick = { open = false; onEdit() }
+                )
                 if (inPlaylist != null) {
                     DropdownMenuItem(
                         text = { Text("Retirer de la playlist") },
@@ -299,21 +353,28 @@ private fun TrackRow(
 fun PlayerScreen(
     c: MediaController?,
     tracks: List<Track>,
+    rev: Int,
+    folders: List<String>,
     themeMode: Int,
     dynamic: Boolean,
     onTheme: (Int) -> Unit,
-    onDynamic: (Boolean) -> Unit
+    onDynamic: (Boolean) -> Unit,
+    onFolders: (List<String>) -> Unit,
+    onEdit: (Track, String, String) -> Unit
 ) {
     val ctx = LocalContext.current
     val rp = remember { ctx.getSharedPreferences("resume", Context.MODE_PRIVATE) }
     val ap = remember { ctx.getSharedPreferences("audio", Context.MODE_PRIVATE) }
     val store = remember { PlaylistStore(ctx) }
+    val favStore = remember { FavStore(ctx) }
     val playlists = remember { mutableStateMapOf<String, List<Long>>().apply { putAll(store.load()) } }
+    val favs = remember { mutableStateListOf<Long>().apply { addAll(favStore.load()) } }
 
     var playing by remember { mutableStateOf(false) }
     var curId by remember { mutableLongStateOf(-1L) }
     var shuffle by remember { mutableStateOf(false) }
     var repeat by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
+    var speed by remember { mutableFloatStateOf(1f) }
     var pos by remember { mutableLongStateOf(0L) }
     var dur by remember { mutableLongStateOf(0L) }
     var drag by remember { mutableStateOf(false) }
@@ -325,7 +386,10 @@ fun PlayerScreen(
     var openPl by remember { mutableStateOf<String?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var showNew by remember { mutableStateOf(false) }
+    var showTimer by remember { mutableStateOf(false) }
+    var showFolders by remember { mutableStateOf(false) }
     var pending by remember { mutableStateOf<Track?>(null) }
+    var editing by remember { mutableStateOf<Track?>(null) }
 
     var showLyrics by remember { mutableStateOf(false) }
     var lyrics by remember { mutableStateOf<String?>(null) }
@@ -334,15 +398,24 @@ fun PlayerScreen(
     var bass by remember { mutableFloatStateOf(ap.getFloat("bass", 0f)) }
     var treble by remember { mutableFloatStateOf(ap.getFloat("treble", 0f)) }
     var norm by remember { mutableStateOf(ap.getBoolean("norm", false)) }
+    var xfade by remember { mutableFloatStateOf(ap.getInt("xfade", 0).toFloat()) }
+    var sleepEnd by remember { mutableLongStateOf(0L) }
 
-    val current = remember(curId, tracks.size) { tracks.firstOrNull { it.id == curId } }
-    val byId = remember(tracks.size) { tracks.associateBy { it.id } }
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val p = treeUriToPath(uri)
+            if (p != null && p !in folders) onFolders(folders + p)
+        }
+    }
+
+    val current = tracks.firstOrNull { it.id == curId }
 
     fun sync(p: Player) {
         playing = p.isPlaying
         curId = p.currentMediaItem?.mediaId?.toLongOrNull() ?: -1L
         shuffle = p.shuffleModeEnabled
         repeat = p.repeatMode
+        speed = p.playbackParameters.speed
         dur = if (p.duration > 0) p.duration else 0L
     }
 
@@ -369,13 +442,31 @@ fun PlayerScreen(
         }
     }
 
+    fun toggleFav(id: Long) {
+        if (id in favs) favs.remove(id) else favs.add(id)
+        favStore.save(favs.toSet())
+    }
+
     fun sendAudio() {
         val args = Bundle().apply {
             putFloat("bass", bass)
             putFloat("treble", treble)
             putBoolean("norm", norm)
+            putInt("xfade", xfade.roundToInt())
         }
         c?.sendCustomCommand(SessionCommand(CMD_AUDIO, Bundle.EMPTY), args)
+    }
+
+    fun setSleep(min: Int) {
+        sleepEnd = if (min > 0) System.currentTimeMillis() + min * 60_000L else 0L
+        val args = Bundle().apply { putInt("min", min) }
+        c?.sendCustomCommand(SessionCommand(CMD_SLEEP, Bundle.EMPTY), args)
+    }
+
+    fun cycleSpeed() {
+        val speeds = listOf(0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f)
+        val i = speeds.indexOfFirst { abs(it - speed) < 0.01f }
+        c?.setPlaybackSpeed(speeds[(i + 1) % speeds.size])
     }
 
     DisposableEffect(c) {
@@ -403,11 +494,17 @@ fun PlayerScreen(
         }
     }
 
-    // Position de lecture + sauvegarde régulière
+    // Envoie les réglages au service dès la connexion (fondu enchaîné, égaliseur...)
+    LaunchedEffect(c) {
+        if (c != null) sendAudio()
+    }
+
+    // Position de lecture + sauvegarde régulière + minuteur
     LaunchedEffect(c) {
         var n = 0
         while (true) {
             if (c != null && !drag) pos = c.currentPosition
+            sleepEnd = ap.getLong("sleepEnd", 0L)
             n++
             if (c != null && n % 4 == 0 && curId >= 0) {
                 rp.edit().putLong("lastId", curId).putLong("lastPos", c.currentPosition).apply()
@@ -434,6 +531,9 @@ fun PlayerScreen(
 
     BackHandler(enabled = expanded) { expanded = false }
     BackHandler(enabled = !expanded && tab == TAB_PLAYLISTS && openPl != null) { openPl = null }
+
+    val now = System.currentTimeMillis()
+    val remainMin = if (sleepEnd > now) ((sleepEnd - now) / 60_000L + 1).toInt() else 0
 
     // ---------- Dialogue : nouvelle playlist ----------
     if (showNew) {
@@ -463,6 +563,92 @@ fun PlayerScreen(
         )
     }
 
+    // ---------- Dialogue : modifier les infos ----------
+    editing?.let { et ->
+        var nt by remember(et.id) { mutableStateOf(et.title) }
+        var na by remember(et.id) { mutableStateOf(et.artist) }
+        AlertDialog(
+            onDismissRequest = { editing = null },
+            title = { Text("Modifier les infos") },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = nt, onValueChange = { nt = it },
+                        singleLine = true, label = { Text("Titre") }
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = na, onValueChange = { na = it },
+                        singleLine = true, label = { Text("Artiste") }
+                    )
+                    Text(
+                        "Change l’affichage dans l’appli, pas le fichier audio.",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { onEdit(et, nt, na); editing = null }) { Text("Enregistrer") }
+            },
+            dismissButton = { TextButton(onClick = { editing = null }) { Text("Annuler") } }
+        )
+    }
+
+    // ---------- Dialogue : minuteur d'arrêt ----------
+    if (showTimer) {
+        AlertDialog(
+            onDismissRequest = { showTimer = false },
+            title = { Text("Minuteur d’arrêt") },
+            text = {
+                Column {
+                    Text(if (remainMin > 0) "La musique s’arrête dans $remainMin min" else "Désactivé")
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()).padding(top = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Chip("Off", remainMin == 0) { setSleep(0) }
+                        Chip("15 min", false) { setSleep(15); showTimer = false }
+                        Chip("30 min", false) { setSleep(30); showTimer = false }
+                        Chip("60 min", false) { setSleep(60); showTimer = false }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showTimer = false }) { Text("Fermer") } }
+        )
+    }
+
+    // ---------- Dialogue : dossiers scannés ----------
+    if (showFolders) {
+        AlertDialog(
+            onDismissRequest = { showFolders = false },
+            title = { Text("Dossiers de musique") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text(
+                        "Toute la musique de ces dossiers (et sous-dossiers) apparaît dans l’appli.",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    folders.forEach { p ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(folderLabel(p), Modifier.weight(1f), fontSize = 14.sp)
+                            TextButton(onClick = { onFolders(folders.filter { it != p }) }) { Text("✕") }
+                        }
+                    }
+                    Row(
+                        Modifier.horizontalScroll(rememberScrollState()).padding(top = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Chip("＋ Ajouter un dossier", true) { picker.launch(null) }
+                        Chip("Par défaut", false) { onFolders(DEFAULT_FOLDERS) }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showFolders = false }) { Text("Fermer") } }
+        )
+    }
+
     // ---------- Dialogue : réglages ----------
     if (showSettings) {
         AlertDialog(
@@ -470,6 +656,19 @@ fun PlayerScreen(
             title = { Text("Réglages") },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text(
+                        "Fondu enchaîné : " +
+                            if (xfade.roundToInt() == 0) "désactivé" else "${xfade.roundToInt()} s",
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Slider(
+                        value = xfade,
+                        onValueChange = { xfade = it },
+                        onValueChangeFinished = { sendAudio() },
+                        valueRange = 0f..12f,
+                        steps = 11
+                    )
+                    Spacer(Modifier.height(12.dp))
                     Text("Thème", fontWeight = FontWeight.SemiBold)
                     Row(
                         Modifier.padding(vertical = 8.dp),
@@ -504,6 +703,10 @@ fun PlayerScreen(
                         Text("Normaliser le volume", Modifier.weight(1f))
                         Switch(checked = norm, onCheckedChange = { norm = it; sendAudio() })
                     }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = { showSettings = false; showFolders = true }) {
+                        Text("Dossiers de musique…")
+                    }
                     Text(
                         "Lecture sans blanc : automatique quand les fichiers le permettent.",
                         fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -516,9 +719,17 @@ fun PlayerScreen(
     }
 
     if (expanded && current != null) {
-        // ---------- Lecteur plein écran ----------
+        // ---------- Lecteur plein écran (tirer vers le bas pour fermer) ----------
         Column(
-            Modifier.fillMaxSize().systemBarsPadding().padding(24.dp),
+            Modifier.fillMaxSize().systemBarsPadding().padding(24.dp)
+                .pointerInput(Unit) {
+                    var dy = 0f
+                    detectVerticalDragGestures(
+                        onDragStart = { dy = 0f },
+                        onDragEnd = { if (dy > 220f) expanded = false },
+                        onVerticalDrag = { _, d -> dy += d }
+                    )
+                },
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -592,17 +803,35 @@ fun PlayerScreen(
                     )
                 }
             }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = { cycleSpeed() }) {
+                    Text(if (speed % 1f == 0f) "${speed.toInt()}×" else "$speed×", fontSize = 18.sp)
+                }
+                TextButton(onClick = { toggleFav(current.id) }) {
+                    Text(if (current.id in favs) "❤" else "♡", fontSize = 22.sp)
+                }
+                TextButton(onClick = { showTimer = true }) {
+                    Text(if (remainMin > 0) "⏲ $remainMin min" else "⏲", fontSize = 18.sp)
+                }
+            }
         }
     } else {
         // ---------- Bibliothèque + barre de lecture ----------
-        val filtered = remember(tracks.size, query) {
+        val filtered = remember(tracks.size, query, rev) {
             val q = query.trim()
             if (q.isEmpty()) tracks.toList()
             else tracks.filter {
                 it.title.contains(q, true) || it.artist.contains(q, true) || it.album.contains(q, true)
             }
         }
-        val entries = remember(filtered, tab) { buildEntries(filtered, tab) }
+        val entries = remember(filtered, tab, favs.size) {
+            if (tab == TAB_FAV) buildEntries(filtered.filter { it.id in favs }, 0)
+            else buildEntries(filtered, tab)
+        }
         val shown = remember(entries) { entries.filterIsInstance<Entry.Item>().map { it.track } }
 
         Column(Modifier.fillMaxSize().systemBarsPadding()) {
@@ -614,6 +843,9 @@ fun PlayerScreen(
                     "Ma musique", fontSize = 22.sp, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f)
                 )
+                TextButton(onClick = { showTimer = true }) {
+                    Text(if (remainMin > 0) "⏲ $remainMin min" else "⏲", fontSize = 20.sp)
+                }
                 TextButton(onClick = { showSettings = true }) { Text("⚙", fontSize = 22.sp) }
             }
             OutlinedTextField(
@@ -661,6 +893,7 @@ fun PlayerScreen(
                 } else if (tab == TAB_PLAYLISTS) {
                     // Contenu d'une playlist
                     val name = openPl ?: ""
+                    val byId = tracks.associateBy { it.id }
                     val plTracks = (playlists[name] ?: emptyList()).mapNotNull { byId[it] }
                     Column(Modifier.fillMaxSize()) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -687,10 +920,12 @@ fun PlayerScreen(
                         LazyColumn(Modifier.weight(1f)) {
                             items(plTracks) { t ->
                                 TrackRow(
-                                    t, t.id == curId, playlists, name,
+                                    t, t.id == curId, t.id in favs, playlists, name,
                                     onPlay = { playList(plTracks, t.id) },
+                                    onFav = { toggleFav(t.id) },
                                     onAdd = { addToPlaylist(it, t) },
                                     onNew = { pending = t; showNew = true },
+                                    onEdit = { editing = t },
                                     onRemove = {
                                         playlists[name] = (playlists[name] ?: emptyList()) - t.id
                                         persist()
@@ -700,11 +935,14 @@ fun PlayerScreen(
                         }
                     }
                 } else {
-                    // Titres / Artistes / Albums / Dossiers
+                    // Titres / Artistes / Albums / Dossiers / Favoris
                     if (shown.isEmpty()) {
                         Text(
-                            if (tracks.isEmpty()) "Aucune musique trouvée dans le dossier Music"
-                            else "Aucun résultat",
+                            when {
+                                tab == TAB_FAV -> "Aucun favori : touche ♡ sur un titre."
+                                tracks.isEmpty() -> "Aucune musique trouvée dans les dossiers choisis"
+                                else -> "Aucun résultat"
+                            },
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
@@ -717,10 +955,12 @@ fun PlayerScreen(
                                     modifier = Modifier.padding(top = 16.dp, bottom = 4.dp)
                                 )
                                 is Entry.Item -> TrackRow(
-                                    e.track, e.track.id == curId, playlists, null,
+                                    e.track, e.track.id == curId, e.track.id in favs, playlists, null,
                                     onPlay = { playList(shown, e.track.id) },
+                                    onFav = { toggleFav(e.track.id) },
                                     onAdd = { addToPlaylist(it, e.track) },
                                     onNew = { pending = e.track; showNew = true },
+                                    onEdit = { editing = e.track },
                                     onRemove = {}
                                 )
                             }
@@ -730,9 +970,22 @@ fun PlayerScreen(
             }
 
             if (current != null) {
+                // Barre de lecture : toucher = plein écran, glisser = titre suivant / précédent
                 Surface(
                     tonalElevation = 4.dp,
-                    modifier = Modifier.fillMaxWidth().clickable { expanded = true }
+                    modifier = Modifier.fillMaxWidth()
+                        .pointerInput(c) {
+                            var dx = 0f
+                            detectHorizontalDragGestures(
+                                onDragStart = { dx = 0f },
+                                onDragEnd = {
+                                    if (dx < -120f) c?.seekToNext()
+                                    else if (dx > 120f) c?.seekToPrevious()
+                                },
+                                onHorizontalDrag = { _, d -> dx += d }
+                            )
+                        }
+                        .clickable { expanded = true }
                 ) {
                     Column {
                         LinearProgressIndicator(
