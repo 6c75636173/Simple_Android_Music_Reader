@@ -7,12 +7,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.os.Handler
-import android.os.Looper
 import android.widget.RemoteViews
-import androidx.core.content.ContextCompat
-import androidx.media3.session.MediaController
-import androidx.media3.session.SessionToken
 
 /** Widget d'écran d'accueil : pochette, titre, précédent / lecture / suivant. */
 class MusicWidget : AppWidgetProvider() {
@@ -29,21 +24,16 @@ class MusicWidget : AppWidgetProvider() {
         appWidgetManager.updateAppWidget(appWidgetIds, v)
     }
 
-    override fun onReceive(context: Context, intent: Intent) {
-        super.onReceive(context, intent)
-        val a = intent.action ?: return
-        if (a == ACT_PLAY || a == ACT_NEXT || a == ACT_PREV) control(context.applicationContext, a)
-    }
-
     companion object {
         const val ACT_PLAY = "com.lucas.musique.WIDGET_PLAY"
         const val ACT_NEXT = "com.lucas.musique.WIDGET_NEXT"
         const val ACT_PREV = "com.lucas.musique.WIDGET_PREV"
 
+        // Les boutons parlent directement au service de lecture (pas de connexion à créer).
         private fun pi(ctx: Context, action: String, code: Int): PendingIntent =
-            PendingIntent.getBroadcast(
+            PendingIntent.getService(
                 ctx, code,
-                Intent(ctx, MusicWidget::class.java).setAction(action),
+                Intent(ctx, PlaybackService::class.java).setAction(action),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
 
@@ -51,12 +41,9 @@ class MusicWidget : AppWidgetProvider() {
             val v = RemoteViews(ctx.packageName, R.layout.widget)
             v.setTextViewText(R.id.w_title, title)
             v.setTextViewText(R.id.w_artist, artist)
-            v.setImageViewResource(
-                R.id.w_play,
-                if (playing) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play
-            )
+            v.setImageViewResource(R.id.w_play, if (playing) R.drawable.ic_pause else R.drawable.ic_play)
             if (cover != null) v.setImageViewBitmap(R.id.w_cover, cover)
-            else v.setImageViewResource(R.id.w_cover, R.drawable.ic_launcher_foreground)
+            else v.setImageViewResource(R.id.w_cover, R.drawable.widget_cover_placeholder)
             v.setOnClickPendingIntent(R.id.w_play, pi(ctx, ACT_PLAY, 1))
             v.setOnClickPendingIntent(R.id.w_prev, pi(ctx, ACT_PREV, 2))
             v.setOnClickPendingIntent(R.id.w_next, pi(ctx, ACT_NEXT, 3))
@@ -78,24 +65,6 @@ class MusicWidget : AppWidgetProvider() {
             val mgr = AppWidgetManager.getInstance(ctx)
             val ids = mgr.getAppWidgetIds(ComponentName(ctx, MusicWidget::class.java))
             if (ids.isNotEmpty()) mgr.updateAppWidget(ids, build(ctx, title, artist, playing, cover))
-        }
-
-        private fun control(ctx: Context, action: String) {
-            val token = SessionToken(ctx, ComponentName(ctx, PlaybackService::class.java))
-            val f = MediaController.Builder(ctx, token).buildAsync()
-            val main = Handler(Looper.getMainLooper())
-            f.addListener({
-                try {
-                    val c = f.get()
-                    when (action) {
-                        ACT_PLAY -> if (c.isPlaying) c.pause() else c.play()
-                        ACT_NEXT -> c.seekToNext()
-                        ACT_PREV -> c.seekToPrevious()
-                    }
-                } catch (_: Exception) {
-                }
-                main.postDelayed({ MediaController.releaseFuture(f) }, 2000)
-            }, ContextCompat.getMainExecutor(ctx))
         }
     }
 }

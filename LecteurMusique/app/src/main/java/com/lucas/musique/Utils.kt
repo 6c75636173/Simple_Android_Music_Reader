@@ -24,11 +24,10 @@ import java.io.FileNotFoundException
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 
-/** Nom de la commande personnalisée (égaliseur / normalisation) envoyée au service. */
-const val CMD_AUDIO = "com.lucas.musique.AUDIO"
-
-/** Commande du minuteur d'arrêt (minutes ; 0 = annuler). */
-const val CMD_SLEEP = "com.lucas.musique.SLEEP"
+/** Commandes personnalisées envoyées au service de lecture. */
+const val CMD_AUDIO = "com.lucas.musique.AUDIO"   // égaliseur, normalisation, fondu
+const val CMD_SLEEP = "com.lucas.musique.SLEEP"   // minuteur d'arrêt (minutes ; 0 = annuler)
+const val CMD_FAV = "com.lucas.musique.FAV"       // bouton favori (notification / écran verrouillé)
 
 /** Dossiers scannés par défaut : Music du stockage interne et de la carte SD. */
 val DEFAULT_FOLDERS = listOf("/storage/emulated/0/Music", "/storage/%-%/Music")
@@ -140,24 +139,27 @@ private fun parseUslt(d: ByteArray): String? {
     return String(d, i, d.size - i, cs).trim().ifEmpty { null }
 }
 
-/** Sauvegarde des playlists (nom -> liste d'identifiants de titres). */
+/**
+ * Playlists : nom -> liste de chemins de fichiers.
+ * Les anciennes playlists (identifiants numériques) sont converties au premier scan.
+ */
 class PlaylistStore(ctx: Context) {
     private val sp = ctx.getSharedPreferences("playlists", Context.MODE_PRIVATE)
 
-    fun load(): Map<String, List<Long>> {
-        val out = LinkedHashMap<String, List<Long>>()
+    fun load(): Map<String, List<String>> {
+        val out = LinkedHashMap<String, List<String>>()
         try {
             val o = JSONObject(sp.getString("data", "{}") ?: "{}")
             for (k in o.keys()) {
                 val a = o.getJSONArray(k)
-                out[k] = List(a.length()) { a.getLong(it) }
+                out[k] = List(a.length()) { a.get(it).toString() }
             }
         } catch (_: Exception) {
         }
         return out
     }
 
-    fun save(m: Map<String, List<Long>>) {
+    fun save(m: Map<String, List<String>>) {
         val o = JSONObject()
         for ((k, v) in m) {
             val a = JSONArray()
@@ -168,40 +170,85 @@ class PlaylistStore(ctx: Context) {
     }
 }
 
-/** Favoris (identifiants de titres). */
+/** Favoris : chemins de fichiers (les anciens identifiants sont convertis au premier scan). */
 class FavStore(ctx: Context) {
     private val sp = ctx.getSharedPreferences("favs", Context.MODE_PRIVATE)
 
-    fun load(): Set<Long> =
-        (sp.getString("ids", "") ?: "").split(",").mapNotNull { it.toLongOrNull() }.toSet()
-
-    fun save(ids: Set<Long>) {
-        sp.edit().putString("ids", ids.joinToString(",")).apply()
-    }
-}
-
-/** Titres / artistes modifiés dans l'appli (le fichier audio n'est pas touché). */
-class MetaStore(ctx: Context) {
-    private val sp = ctx.getSharedPreferences("meta", Context.MODE_PRIVATE)
-
-    fun load(): Map<Long, Pair<String, String>> {
-        val out = LinkedHashMap<Long, Pair<String, String>>()
+    fun load(): MutableSet<String> {
+        val out = LinkedHashSet<String>()
         try {
-            val o = JSONObject(sp.getString("data", "{}") ?: "{}")
-            for (k in o.keys()) {
-                val e = o.getJSONObject(k)
-                val id = k.toLongOrNull() ?: continue
-                out[id] = Pair(e.optString("t"), e.optString("a"))
+            val s = sp.getString("keys", null)
+            if (s != null) {
+                val a = JSONArray(s)
+                for (i in 0 until a.length()) out.add(a.getString(i))
+            } else {
+                (sp.getString("ids", "") ?: "").split(",").filter { it.isNotBlank() }.forEach { out.add(it) }
             }
         } catch (_: Exception) {
         }
         return out
     }
 
-    fun save(m: Map<Long, Pair<String, String>>) {
+    fun save(keys: Collection<String>) {
+        val a = JSONArray()
+        keys.forEach { a.put(it) }
+        sp.edit().putString("keys", a.toString()).remove("ids").apply()
+    }
+
+    /** Ajoute ou retire un favori ; renvoie true s'il est maintenant favori. */
+    fun toggle(key: String): Boolean {
+        val s = load()
+        val now = if (s.contains(key)) { s.remove(key); false } else { s.add(key); true }
+        save(s)
+        return now
+    }
+}
+
+/** Compteur d'écoutes (un titre compte à partir de 30 s d'écoute). */
+class PlayStore(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("stats", Context.MODE_PRIVATE)
+
+    fun load(): Map<String, Int> {
+        val out = HashMap<String, Int>()
+        try {
+            val o = JSONObject(sp.getString("counts", "{}") ?: "{}")
+            for (k in o.keys()) out[k] = o.getInt(k)
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    fun inc(key: String) {
+        try {
+            val o = JSONObject(sp.getString("counts", "{}") ?: "{}")
+            o.put(key, o.optInt(key, 0) + 1)
+            sp.edit().putString("counts", o.toString()).apply()
+        } catch (_: Exception) {
+        }
+    }
+}
+
+/** Titres / artistes modifiés dans l'appli (le fichier audio n'est pas touché), par chemin. */
+class MetaStore(ctx: Context) {
+    private val sp = ctx.getSharedPreferences("meta2", Context.MODE_PRIVATE)
+
+    fun load(): Map<String, Pair<String, String>> {
+        val out = LinkedHashMap<String, Pair<String, String>>()
+        try {
+            val o = JSONObject(sp.getString("data", "{}") ?: "{}")
+            for (k in o.keys()) {
+                val e = o.getJSONObject(k)
+                out[k] = Pair(e.optString("t"), e.optString("a"))
+            }
+        } catch (_: Exception) {
+        }
+        return out
+    }
+
+    fun save(m: Map<String, Pair<String, String>>) {
         val o = JSONObject()
-        for ((id, v) in m) {
-            o.put(id.toString(), JSONObject().put("t", v.first).put("a", v.second))
+        for ((path, v) in m) {
+            o.put(path, JSONObject().put("t", v.first).put("a", v.second))
         }
         sp.edit().putString("data", o.toString()).apply()
     }

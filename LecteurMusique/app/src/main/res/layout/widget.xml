@@ -13,7 +13,7 @@
         android:layout_width="56dp"
         android:layout_height="56dp"
         android:scaleType="centerCrop"
-        android:src="@drawable/ic_launcher_foreground" />
+        android:src="@drawable/widget_cover_placeholder" />
 
     <LinearLayout
         android:id="@+id/w_info"
@@ -30,7 +30,7 @@
             android:ellipsize="end"
             android:maxLines="1"
             android:text="Lecteur"
-            android:textColor="#FFFFFF"
+            android:textColor="@color/w_text"
             android:textSize="14sp"
             android:textStyle="bold" />
 
@@ -40,7 +40,7 @@
             android:layout_height="wrap_content"
             android:ellipsize="end"
             android:maxLines="1"
-            android:textColor="#B8BBC6"
+            android:textColor="@color/w_sub"
             android:textSize="12sp" />
     </LinearLayout>
 
@@ -49,19 +49,22 @@
         android:layout_width="40dp"
         android:layout_height="40dp"
         android:background="@null"
-        android:src="@android:drawable/ic_media_previous" />
+        android:src="@drawable/ic_prev"
+        android:tint="@color/w_text" />
 
     <ImageButton
         android:id="@+id/w_play"
         android:layout_width="44dp"
         android:layout_height="44dp"
         android:background="@null"
-        android:src="@android:drawable/ic_media_play" />
+        android:src="@drawable/ic_play"
+        android:tint="@color/w_text" />
 
     <ImageButton
         android:id="@+id/w_next"
         android:layout_width="40dp"
         android:layout_height="40dp"
         android:background="@null"
-        android:src="@android:drawable/ic_media_next" />
+        android:src="@drawable/ic_next"
+        android:tint="@color/w_text" />
 </LinearLayout>

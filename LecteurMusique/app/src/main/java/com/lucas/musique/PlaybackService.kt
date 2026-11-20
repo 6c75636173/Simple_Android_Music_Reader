@@ -15,10 +15,12 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.CommandButton
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import kotlin.math.cos
@@ -26,7 +28,7 @@ import kotlin.math.sin
 
 /**
  * Service de lecture : arrière-plan, notification, égaliseur, normalisation,
- * fondu enchaîné (2 lecteurs), minuteur d'arrêt et widget.
+ * fondu enchaîné (2 lecteurs), minuteur d'arrêt, widget, favori et compteur d'écoutes.
  */
 class PlaybackService : MediaSessionService() {
 
@@ -40,9 +42,16 @@ class PlaybackService : MediaSessionService() {
 
     // --- état du fondu enchaîné ---
     private var xfadeMs = 0L
+    private var forceGapless = false
+    private var fadeLen = 0L
     private var fadeStart = 0L // 0 = pas de fondu en cours
     private var fadePrepared = false
     private var preparedId: String? = null
+    private var giveUpId: String? = null
+    private var countedKey: String? = null
+
+    private val favListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> updateFavButton() }
 
     private val tick = object : Runnable {
         override fun run() {
@@ -63,6 +72,7 @@ class PlaybackService : MediaSessionService() {
         super.onCreate()
         audioPrefs = getSharedPreferences("audio", MODE_PRIVATE)
         xfadeMs = audioPrefs.getInt("xfade", 0) * 1000L
+        forceGapless = audioPrefs.getBoolean("gapless", false)
         audioPrefs.edit().putLong("sleepEnd", 0L).apply()
 
         player = ExoPlayer.Builder(this)
@@ -94,6 +104,8 @@ class PlaybackService : MediaSessionService() {
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 saveResume(player)
+                countedKey = null
+                giveUpId = null
                 if (fadeStart != 0L) {
                     // la transition déclenchée par le fondu lui-même arrive dans les 800 ms
                     if (SystemClock.uptimeMillis() - fadeStart > 800) abortFade()
@@ -101,6 +113,7 @@ class PlaybackService : MediaSessionService() {
                     fadePrepared = false
                 }
                 updateWidget()
+                updateFavButton()
             }
 
             override fun onAudioSessionIdChanged(audioSessionId: Int) {
@@ -120,6 +133,7 @@ class PlaybackService : MediaSessionService() {
                     val cmds = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
                         .add(SessionCommand(CMD_AUDIO, Bundle.EMPTY))
                         .add(SessionCommand(CMD_SLEEP, Bundle.EMPTY))
+                        .add(SessionCommand(CMD_FAV, Bundle.EMPTY))
                         .build()
                     return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
                         .setAvailableSessionCommands(cmds)
@@ -135,14 +149,17 @@ class PlaybackService : MediaSessionService() {
                     when (customCommand.customAction) {
                         CMD_AUDIO -> {
                             val xf = args.getInt("xfade", 0).coerceIn(0, 12)
+                            val gl = args.getBoolean("gapless", false)
                             audioPrefs.edit()
                                 .putFloat("bass", args.getFloat("bass", 0f))
                                 .putFloat("treble", args.getFloat("treble", 0f))
                                 .putBoolean("norm", args.getBoolean("norm", false))
                                 .putInt("xfade", xf)
+                                .putBoolean("gapless", gl)
                                 .apply()
                             xfadeMs = xf * 1000L
-                            if (xfadeMs == 0L && fadeStart == 0L) fadePrepared = false
+                            forceGapless = gl
+                            if (fadeMs() == 0L && fadeStart == 0L) fadePrepared = false
                             applyEffects()
                         }
                         CMD_SLEEP -> {
@@ -156,6 +173,10 @@ class PlaybackService : MediaSessionService() {
                             } else {
                                 audioPrefs.edit().putLong("sleepEnd", 0L).apply()
                             }
+                        }
+                        CMD_FAV -> {
+                            currentPath()?.let { FavStore(this@PlaybackService).toggle(it) }
+                            updateFavButton()
                         }
                     }
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
@@ -175,29 +196,69 @@ class PlaybackService : MediaSessionService() {
                 }
             })
             .build()
+
+        getSharedPreferences("favs", MODE_PRIVATE).registerOnSharedPreferenceChangeListener(favListener)
+        updateFavButton()
     }
+
+    /** Boutons du widget : on reçoit l'action directement ici. */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            MusicWidget.ACT_PLAY -> if (player.isPlaying) player.pause() else player.play()
+            MusicWidget.ACT_NEXT -> player.seekToNext()
+            MusicWidget.ACT_PREV -> player.seekToPrevious()
+        }
+        return super.onStartCommand(intent, flags, startId)
+    }
+
+    private fun currentPath(): String? =
+        player.currentMediaItem?.mediaMetadata?.extras?.getString("path")
 
     // ------------------------------------------------------------------
     // Fondu enchaîné : un 2e lecteur joue la fin du titre qui sort pendant
-    // que le lecteur principal démarre le titre suivant. Volumes en
-    // puissance constante (sinus / cosinus).
+    // que le lecteur principal démarre le titre suivant (volumes en
+    // puissance constante). Le 2e lecteur est préparé À L'AVANCE à la bonne
+    // position pour éviter tout à-coup (cartes SD lentes).
     // ------------------------------------------------------------------
 
+    /** Durée effective du chevauchement : fondu choisi, sinon 0,3 s si « sans blanc forcé ». */
+    private fun fadeMs(): Long = if (xfadeMs > 0L) xfadeMs else if (forceGapless) 300L else 0L
+
+    private fun countPlay() {
+        val key = currentPath() ?: return
+        if (key != countedKey && player.currentPosition >= 30_000L) {
+            countedKey = key
+            PlayStore(this).inc(key)
+        }
+    }
+
     private fun onTick() {
+        countPlay()
         if (fadeStart != 0L) {
             stepFade()
             return
         }
-        if (xfadeMs <= 0L || !player.isPlaying) return
+        val fm = fadeMs()
+        if (fm <= 0L || !player.isPlaying) return
         if (player.repeatMode == Player.REPEAT_MODE_ONE || !player.hasNextMediaItem()) {
             fadePrepared = false
             return
         }
         val dur = player.duration
-        if (dur == C.TIME_UNSET || dur < xfadeMs * 2 + 2000) return // titre trop court
+        if (dur == C.TIME_UNSET || dur < fm * 2 + 8000) return // titre trop court
+        val id = player.currentMediaItem?.mediaId
+        if (id == giveUpId) return
         val remaining = dur - player.currentPosition
-        if (remaining <= xfadeMs + 2500 && !fadePrepared) prepareFader()
-        if (remaining <= xfadeMs && fadePrepared) startFade()
+        if (remaining <= fm + 6000 && !fadePrepared) prepareFader(dur - fm - 1000)
+        if (remaining <= fm && fadePrepared) {
+            if (fader?.playbackState == Player.STATE_READY) {
+                startFade(fm)
+            } else if (remaining < fm - minOf(1500L, fm / 2)) {
+                // le 2e lecteur n'est pas prêt à temps : on laisse la transition normale
+                fadePrepared = false
+                giveUpId = id
+            }
+        }
     }
 
     private fun buildFader(): ExoPlayer {
@@ -214,10 +275,10 @@ class PlaybackService : MediaSessionService() {
         return f
     }
 
-    private fun prepareFader() {
+    private fun prepareFader(startMs: Long) {
         val item = player.currentMediaItem ?: return
         val f = fader ?: buildFader().also { fader = it }
-        f.setMediaItem(item)
+        f.setMediaItem(item, startMs.coerceAtLeast(0L))
         f.volume = 0f
         f.playWhenReady = false
         f.prepare()
@@ -225,15 +286,16 @@ class PlaybackService : MediaSessionService() {
         fadePrepared = true
     }
 
-    private fun startFade() {
+    private fun startFade(len: Long) {
         val f = fader ?: return
         if (preparedId != player.currentMediaItem?.mediaId) {
             fadePrepared = false
             return
         }
         fadePrepared = false
+        fadeLen = len
         f.playbackParameters = player.playbackParameters
-        f.seekTo(player.currentPosition + 120)
+        f.seekTo(player.currentPosition + 150)
         f.volume = 1f
         f.play()
         fadeStart = SystemClock.uptimeMillis()
@@ -242,11 +304,11 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun stepFade() {
-        if (xfadeMs <= 0L) {
+        if (fadeLen <= 0L) {
             endFade()
             return
         }
-        val t = ((SystemClock.uptimeMillis() - fadeStart).toFloat() / xfadeMs).coerceIn(0f, 1f)
+        val t = ((SystemClock.uptimeMillis() - fadeStart).toFloat() / fadeLen).coerceIn(0f, 1f)
         val a = t * Math.PI / 2
         player.volume = sin(a).toFloat()
         fader?.volume = cos(a).toFloat()
@@ -282,6 +344,19 @@ class PlaybackService : MediaSessionService() {
     }
 
     // ------------------------------------------------------------------
+
+    /** Bouton favori (♥) dans la notification et sur l'écran verrouillé. */
+    private fun updateFavButton() {
+        val s = session ?: return
+        val path = currentPath()
+        val fav = path != null && FavStore(this).load().contains(path)
+        val b = CommandButton.Builder()
+            .setDisplayName(if (fav) "Retirer des favoris" else "Ajouter aux favoris")
+            .setIconResId(if (fav) R.drawable.ic_favorite else R.drawable.ic_favorite_border)
+            .setSessionCommand(SessionCommand(CMD_FAV, Bundle.EMPTY))
+            .build()
+        s.setCustomLayout(ImmutableList.of(b))
+    }
 
     private fun updateWidget() {
         if (!MusicWidget.hasWidgets(applicationContext)) return
@@ -375,6 +450,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        getSharedPreferences("favs", MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(favListener)
         session?.player?.let { saveResume(it) }
         try { eq?.release() } catch (_: Exception) {}
         try { dp?.release() } catch (_: Exception) {}
